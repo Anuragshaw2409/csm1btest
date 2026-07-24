@@ -79,6 +79,17 @@ if [ "$SKIP_SETUP" -eq 0 ]; then
   log "Installing the agent (livekit-agents + local STT/LLM/TTS plugins)"
   pip install -q -e "$AGENT_DIR"
 
+  # livekit-agents' own dependency resolution can silently pull in a newer
+  # huggingface_hub than the ==0.28.1 pin in requirements.txt/pyproject.toml
+  # (same class of issue as webui.py's gradio conflict) -- re-pin it, since
+  # moshi/transformers/tokenizers need <1.0 / a specific range.
+  pip install -q "huggingface_hub==0.28.1"
+
+  if ! pip check >/dev/null 2>&1; then
+    echo "WARNING: pip reports dependency conflicts, see below (may still work):" >&2
+    pip check || true
+  fi
+
   # moshi's quantize.linear() unconditionally imports bitsandbytes even when
   # not actually quantizing -- same fix as the main csm-main project.
   pip install -q bitsandbytes
