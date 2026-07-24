@@ -261,8 +261,12 @@ class Pipeline:
     def process_chunk(self, chunk, sess: SessionState, chat_display: list):
         """Feeds one streamed audio chunk through VAD/turn-detection. When a
         full user turn is detected, runs STT -> LLM -> TTS and returns the
-        reply audio + updated chat display. Otherwise returns no new audio."""
-        reply_audio = None
+        reply audio + updated chat display. Otherwise leaves the audio output
+        untouched (gr.skip()) rather than clearing it -- since this callback
+        fires every ~100-200ms, returning None here would reset the Audio
+        component back to empty right after a reply was just set, cutting
+        playback off before the browser even starts it."""
+        reply_audio = gr.skip()
         last_vad_prob = None
 
         if sess is None:
