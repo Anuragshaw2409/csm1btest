@@ -262,23 +262,42 @@ class Pipeline:
         """Feeds one streamed audio chunk through VAD/turn-detection. When a
         full user turn is detected, runs STT -> LLM -> TTS and returns the
         reply audio + updated chat display. Otherwise returns no new audio."""
-        status = "Listening..."
         reply_audio = None
+        last_vad_prob = None
+
+        if sess is None:
+            # Session state hasn't finished initializing yet (demo.load() race);
+            # nothing to do with this chunk.
+            return sess, chat_display, reply_audio, "Session still initializing, one sec..."
 
         if chunk is None:
-            return sess, chat_display, reply_audio, status
+            return sess, chat_display, reply_audio, "Listening... (no audio received yet)"
 
         sr, data = chunk
         data = np.asarray(data)
         if data.ndim > 1:
             data = data.mean(axis=1)
+
+        raw_dtype = str(data.dtype)
+        raw_min, raw_max = (float(np.min(data)), float(np.max(data))) if data.size else (0.0, 0.0)
+
         if np.issubdtype(data.dtype, np.floating):
+            # float chunks are typically already in [-1, 1]
             data = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
         else:
             data = data.astype(np.int16)
         data = resample_int16(data, sr, SAMPLE_RATE)
 
         sess.pcm_buffer = np.concatenate([sess.pcm_buffer, data])
+        chunk_peak = int(np.max(np.abs(data))) if data.size else 0
+
+        print(
+            f"[chunk] sr={sr} dtype={raw_dtype} shape={data.shape} "
+            f"raw_range=({raw_min:.4f},{raw_max:.4f}) peak_i16={chunk_peak} "
+            f"buffer_samples={len(sess.pcm_buffer)}"
+        )
+
+        status = None
 
         while len(sess.pcm_buffer) >= WINDOW_SAMPLES:
             frame_i16 = sess.pcm_buffer[:WINDOW_SAMPLES]
@@ -288,6 +307,7 @@ class Pipeline:
             p, sess.vad_context, sess.vad_rnn_state = self.vad.prob(
                 frame_f32, sess.vad_context, sess.vad_rnn_state
             )
+            last_vad_prob = p
 
             if not sess.speaking:
                 sess.pre_buffer.append(frame_i16)
@@ -302,6 +322,7 @@ class Pipeline:
                 if not sess.speaking and sess.speech_run >= MIN_SPEECH_DURATION:
                     sess.speaking = True
                     sess.speech_frames = list(sess.pre_buffer)
+                    print(f"[vad] speech START (p={p:.3f})")
                 if sess.speaking:
                     sess.speech_frames.append(frame_i16)
                 continue
@@ -317,25 +338,29 @@ class Pipeline:
             if sess.silence_run < MIN_SILENCE_DURATION and utterance_sec < MAX_UTTERANCE_SEC:
                 continue
 
+            print(f"[vad] pause detected after {utterance_sec:.2f}s of speech, transcribing...")
             audio = np.concatenate(sess.speech_frames).astype(np.float32) / 32768.0
             text = transcribe(self.stt, audio)
+            print(f"[stt] {text!r}")
 
             if not text:
                 sess.speaking = False
                 sess.speech_frames = []
                 sess.silence_run = 0.0
                 sess.grace_rounds_used = 0
+                status = "Heard silence/noise, no speech recognized. Listening..."
                 continue
 
             candidate_ctx = sess.chat_history + [{"role": "user", "content": text}]
             eou_prob = self.eou.probability(candidate_ctx)
             done_talking = eou_prob >= self.eou.threshold
             timed_out = utterance_sec >= MAX_UTTERANCE_SEC or sess.grace_rounds_used >= EOU_MAX_GRACE_ROUNDS
+            print(f"[eou] prob={eou_prob:.4f} threshold={self.eou.threshold} done={done_talking or timed_out}")
 
             if not (done_talking or timed_out):
                 sess.grace_rounds_used += 1
                 sess.silence_run = 0.0
-                status = f"(hmm, still talking? eou_prob={eou_prob:.4f})"
+                status = f'Still listening ("{text}"...) eou_prob={eou_prob:.4f} < {self.eou.threshold}'
                 continue
 
             # Finalize the turn.
@@ -345,9 +370,12 @@ class Pipeline:
             sess.grace_rounds_used = 0
 
             sess.chat_history.append({"role": "user", "content": text})
+            print("[llm] querying Ollama...")
             reply_text = get_llm_reply(sess.chat_history)
+            print(f"[llm] {reply_text!r}")
             sess.chat_history.append({"role": "assistant", "content": reply_text})
 
+            print("[tts] generating CSM audio...")
             audio_out = self.generator.generate(
                 text=reply_text,
                 speaker=SPEAKER_ID,
@@ -362,8 +390,17 @@ class Pipeline:
                 {"role": "assistant", "content": reply_text},
             ]
             reply_audio = (self.generator.sample_rate, audio_out.cpu().numpy())
-            status = "Ready. Listening..."
+            print(f"[tts] done, {audio_out.shape[0] / self.generator.sample_rate:.2f}s of audio generated")
+            status = f'You said: "{text}" -> Bot: "{reply_text}"'
             break
+
+        if status is None:
+            vad_str = f"{last_vad_prob:.3f}" if last_vad_prob is not None else "n/a"
+            status = (
+                f"Listening... speaking={sess.speaking} vad_prob={vad_str} "
+                f"peak_i16={chunk_peak} silence_run={sess.silence_run:.2f}s "
+                f"speech_run={sess.speech_run:.2f}s"
+            )
 
         return sess, chat_display, reply_audio, status
 
