@@ -329,20 +329,33 @@ class Pipeline:
                     print(f"[vad] speech START (p={p:.3f})")
                 if sess.speaking:
                     sess.speech_frames.append(frame_i16)
-                continue
+            else:
+                sess.speech_run = 0.0
+                if not sess.speaking:
+                    continue
+                sess.speech_frames.append(frame_i16)
+                sess.silence_run += FRAME_SEC
 
-            sess.speech_run = 0.0
             if not sess.speaking:
                 continue
 
-            sess.speech_frames.append(frame_i16)
-            sess.silence_run += FRAME_SEC
-
+            # MAX_UTTERANCE_SEC is checked unconditionally (not just on "silent"
+            # frames) -- if the stream never reads as clean silence (background
+            # noise/echo/codec artifacts keeping VAD probability elevated), this
+            # is the only thing that forces a turn to ever resolve.
             utterance_sec = len(sess.speech_frames) * FRAME_SEC
-            if sess.silence_run < MIN_SILENCE_DURATION and utterance_sec < MAX_UTTERANCE_SEC:
+            hit_silence_gap = sess.silence_run >= MIN_SILENCE_DURATION
+            hit_max_duration = utterance_sec >= MAX_UTTERANCE_SEC
+            if not (hit_silence_gap or hit_max_duration):
                 continue
 
-            print(f"[vad] pause detected after {utterance_sec:.2f}s of speech, transcribing...")
+            if hit_max_duration and not hit_silence_gap:
+                print(
+                    f"[vad] forced cutoff after {utterance_sec:.2f}s -- never saw clean "
+                    f"silence (current vad_prob={p:.3f}), transcribing anyway..."
+                )
+            else:
+                print(f"[vad] pause detected after {utterance_sec:.2f}s of speech, transcribing...")
             audio = np.concatenate(sess.speech_frames).astype(np.float32) / 32768.0
             text = transcribe(self.stt, audio)
             print(f"[stt] {text!r}")
