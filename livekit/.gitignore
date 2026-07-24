@@ -16,3 +16,6 @@ dist/
 *.onnx
 *.pt
 *.ckpt
+
+# Runtime logs (run_livekit.sh)
+logs/
