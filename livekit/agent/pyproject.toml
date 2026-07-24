@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csm-livekit-agent"
+version = "1.0.0"
+description = "Fully local cascading voice pipeline (Silero VAD + LiveKit turn-detector -> faster-whisper STT -> Ollama LLM -> CSM-1B TTS) on LiveKit Agents"
+requires-python = ">=3.10"
+
+dependencies = [
+    "livekit-agents[silero,turn-detector]~=1.5",
+    "livekit-plugins-openai~=1.5",
+    "python-dotenv",
+    "faster-whisper",
+    # CSM-1B stack (must match ../../requirements.txt in the parent csm-main project)
+    "torch==2.4.0",
+    "torchaudio==2.4.0",
+    "tokenizers==0.21.0",
+    "transformers==4.49.0",
+    "huggingface_hub==0.28.1",
+    "moshi==0.2.2",
+    "torchtune==0.4.0",
+    "torchao==0.9.0",
+    "silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master",
+]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

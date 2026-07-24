@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Secrets
+.env
+.env.local
+
+# Node
+node_modules/
+dist/
+
+# Model caches
+*.onnx
+*.pt
+*.ckpt
