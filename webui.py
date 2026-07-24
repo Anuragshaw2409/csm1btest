@@ -90,7 +90,7 @@ DEACTIVATION_THRESHOLD = max(ACTIVATION_THRESHOLD - 0.15, 0.01)
 MIN_SPEECH_DURATION = 0.05
 MIN_SILENCE_DURATION = 0.55
 PREFIX_PADDING_DURATION = 0.5
-MAX_UTTERANCE_SEC = 20.0
+MAX_UTTERANCE_SEC = 8.0  # hard safety cap: force a turn to resolve even if VAD never sees clean silence
 
 # --- LiveKit turn-detector (semantic end-of-utterance) settings ---
 EOU_REPO = "livekit/turn-detector"
@@ -402,6 +402,7 @@ class Pipeline:
                 f"speech_run={sess.speech_run:.2f}s"
             )
 
+        print(f"[status] {status}")
         return sess, chat_display, reply_audio, status
 
 
