@@ -373,29 +373,39 @@ class Pipeline:
             sess.silence_run = 0.0
             sess.grace_rounds_used = 0
 
-            sess.chat_history.append({"role": "user", "content": text})
-            print("[llm] querying Ollama...")
-            reply_text = get_llm_reply(sess.chat_history)
-            print(f"[llm] {reply_text!r}")
-            sess.chat_history.append({"role": "assistant", "content": reply_text})
+            try:
+                sess.chat_history.append({"role": "user", "content": text})
+                print("[llm] querying Ollama...")
+                reply_text = get_llm_reply(sess.chat_history)
+                print(f"[llm] {reply_text!r}")
+                sess.chat_history.append({"role": "assistant", "content": reply_text})
 
-            print("[tts] generating CSM audio...")
-            audio_out = self.generator.generate(
-                text=reply_text,
-                speaker=SPEAKER_ID,
-                context=sess.voice_context,
-                max_audio_length_ms=MAX_AUDIO_MS,
-            )
-            sess.voice_context.append(Segment(text=reply_text, speaker=SPEAKER_ID, audio=audio_out))
-            sess.voice_context = [sess.voice_context[0]] + sess.voice_context[1:][-(MAX_CONTEXT_SEGMENTS - 1) :]
+                print("[tts] generating CSM audio...")
+                audio_out = self.generator.generate(
+                    text=reply_text,
+                    speaker=SPEAKER_ID,
+                    context=sess.voice_context,
+                    max_audio_length_ms=MAX_AUDIO_MS,
+                )
+                sess.voice_context.append(Segment(text=reply_text, speaker=SPEAKER_ID, audio=audio_out))
+                sess.voice_context = [sess.voice_context[0]] + sess.voice_context[1:][-(MAX_CONTEXT_SEGMENTS - 1) :]
 
-            chat_display = chat_display + [
-                {"role": "user", "content": text},
-                {"role": "assistant", "content": reply_text},
-            ]
-            reply_audio = (self.generator.sample_rate, audio_out.cpu().numpy())
-            print(f"[tts] done, {audio_out.shape[0] / self.generator.sample_rate:.2f}s of audio generated")
-            status = f'You said: "{text}" -> Bot: "{reply_text}"'
+                chat_display = chat_display + [
+                    {"role": "user", "content": text},
+                    {"role": "assistant", "content": reply_text},
+                ]
+                reply_audio = (self.generator.sample_rate, audio_out.cpu().numpy())
+                print(f"[tts] done, {audio_out.shape[0] / self.generator.sample_rate:.2f}s of audio generated")
+                status = f'You said: "{text}" -> Bot: "{reply_text}"'
+            except Exception as e:
+                # Don't let a downstream failure (Ollama down, CSM OOM, etc.) crash
+                # the whole streaming callback -- surface it and keep listening.
+                # Drop the dangling user turn we just appended so chat_history
+                # doesn't end mid-turn on the next request.
+                if sess.chat_history and sess.chat_history[-1]["role"] == "user":
+                    sess.chat_history.pop()
+                print(f"[error] turn failed: {e!r}")
+                status = f"Error generating reply ({type(e).__name__}): {e}. Check server console. Still listening..."
             break
 
         if status is None:
