@@ -1,0 +1,7 @@
+# Additional dependencies for webui.py / talk.py on top of requirements.txt.
+# Installed automatically by setup_server.sh; listed here for reference/reproducibility.
+faster-whisper
+gradio==5.25.2
+onnxruntime
+requests
+huggingface_hub==0.28.1  # re-pin after gradio/faster-whisper install (see setup_server.sh)
