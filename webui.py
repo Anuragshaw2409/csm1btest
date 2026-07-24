@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field
 
 os.environ.setdefault("NO_TORCH_COMPILE", "1")
@@ -367,6 +368,37 @@ class Pipeline:
         return sess, chat_display, reply_audio, status
 
 
+def ensure_self_signed_cert(cert_dir: str, hostnames: list[str]) -> tuple[str, str]:
+    """Generates a temporary self-signed TLS cert/key (via openssl) if one
+    doesn't already exist, valid for the given hostnames/IPs. Browsers will
+    show a one-time "not secure" warning to click through -- that's expected
+    for a self-signed cert, there's no CA behind it."""
+    os.makedirs(cert_dir, exist_ok=True)
+    cert_path = os.path.join(cert_dir, "cert.pem")
+    key_path = os.path.join(cert_dir, "key.pem")
+
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return cert_path, key_path
+
+    print(f"Generating a temporary self-signed TLS certificate at {cert_dir}...")
+    san = ",".join(
+        f"IP:{h}" if h.replace(".", "").isdigit() else f"DNS:{h}" for h in hostnames
+    )
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:4096",
+            "-sha256", "-days", "365", "-nodes",
+            "-keyout", key_path, "-out", cert_path,
+            "-subj", f"/CN={hostnames[0]}",
+            "-addext", f"subjectAltName={san}",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return cert_path, key_path
+
+
 def build_ui(pipeline: Pipeline) -> gr.Blocks:
     with gr.Blocks(title="Local CSM Voice Chat") as demo:
         gr.Markdown(
@@ -409,6 +441,16 @@ def main():
         "--speaker", default="conversational_a", choices=list(VOICE_PROMPTS.keys()),
         help="Which built-in CSM-1B voice prompt to use (conversational_a=female, conversational_b=male).",
     )
+    parser.add_argument(
+        "--https", action="store_true",
+        help="Serve over HTTPS using a temporary self-signed certificate (generated on first "
+        "run, reused after). Browsers will show a one-time 'not secure' warning to click "
+        "through since it's self-signed, not CA-issued.",
+    )
+    parser.add_argument(
+        "--cert-dir", default=os.path.join(os.path.dirname(__file__), ".certs"),
+        help="Where to store/look for the self-signed cert+key (only used with --https).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -417,7 +459,29 @@ def main():
     pipeline = Pipeline(device=device, speaker_name=args.speaker)
     demo = build_ui(pipeline)
     demo.queue()
-    demo.launch(server_name=args.host, server_port=args.port, share=False)
+
+    ssl_certfile = ssl_keyfile = None
+    if args.https:
+        hostnames = [args.host]
+        if args.host in ("0.0.0.0", "127.0.0.1"):
+            hostnames = ["127.0.0.1", "localhost"]
+        ssl_certfile, ssl_keyfile = ensure_self_signed_cert(args.cert_dir, hostnames)
+        scheme = "https"
+    else:
+        scheme = "http"
+
+    if args.https:
+        print(f"\n(Your browser will warn about an untrusted certificate -- that's expected "
+              f"for a self-signed cert, proceed anyway. URL: {scheme}://{args.host}:{args.port})\n")
+
+    demo.launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=False,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+        ssl_verify=False,  # self-signed: nothing to verify against a CA
+    )
 
 
 if __name__ == "__main__":

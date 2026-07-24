@@ -20,6 +20,7 @@
 # Usage:
 #   ./setup_server.sh                       # full setup + launch
 #   ./setup_server.sh --skip-setup          # just (re)launch the web UI
+#   ./setup_server.sh --https               # also serve over HTTPS (self-signed cert)
 #   OLLAMA_MODEL=llama3.2:3b ./setup_server.sh
 #   HF_TOKEN=hf_xxx ./setup_server.sh       # non-interactive HF login
 #
@@ -34,9 +35,11 @@ WEBUI_PORT="${WEBUI_PORT:-7860}"
 WEBUI_HOST="${WEBUI_HOST:-127.0.0.1}"
 VOICE_SPEAKER="${VOICE_SPEAKER:-conversational_a}"
 SKIP_SETUP=0
+HTTPS_FLAG=()
 
 for arg in "$@"; do
   case "$arg" in
+    --https) HTTPS_FLAG=(--https) ;;
     --skip-setup) SKIP_SETUP=1 ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
@@ -47,7 +50,7 @@ log() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 if [ "$SKIP_SETUP" -eq 1 ]; then
   log "Skipping setup, launching web UI directly"
   source "$VENV_DIR/bin/activate"
-  exec python webui.py --host "$WEBUI_HOST" --port "$WEBUI_PORT" --speaker "$VOICE_SPEAKER"
+  exec python webui.py --host "$WEBUI_HOST" --port "$WEBUI_PORT" --speaker "$VOICE_SPEAKER" "${HTTPS_FLAG[@]}"
 fi
 
 log "Checking for NVIDIA GPU"
@@ -177,4 +180,4 @@ print("All models cached.")
 PYEOF
 
 log "Setup complete. Launching web UI..."
-OLLAMA_MODEL="$OLLAMA_MODEL" python webui.py --host "$WEBUI_HOST" --port "$WEBUI_PORT" --speaker "$VOICE_SPEAKER"
+OLLAMA_MODEL="$OLLAMA_MODEL" python webui.py --host "$WEBUI_HOST" --port "$WEBUI_PORT" --speaker "$VOICE_SPEAKER" "${HTTPS_FLAG[@]}"

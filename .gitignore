@@ -44,3 +44,6 @@ context_audio.wav
 # Model files
 *.pt
 *.ckpt
+
+# Self-signed TLS certs (webui.py --https)
+.certs/
