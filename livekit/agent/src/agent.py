@@ -1,6 +1,9 @@
 import logging
+import os
 
+import torchaudio
 from dotenv import load_dotenv
+from huggingface_hub import hf_hub_download
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -22,9 +25,37 @@ from livekit.plugins import (
 )
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+from csm_tts_remote import CSMRemoteTTS
+
 logger = logging.getLogger("agent-customer-support-549")
 
 load_dotenv(".env.local")
+
+# CSM-1B runs on a remote GPU box (../../../server/tts_server.py) -- this
+# agent process calls it over a WebSocket instead of loading CSM in-process.
+# e.g. wss://<gpu-host>:8000/v1/tts/stream.
+CSM_TTS_SERVER_URL = os.environ.get("CSM_TTS_SERVER_URL", "ws://localhost:8000/v1/tts/stream")
+CSM_TTS_SERVER_INSECURE_TLS = os.environ.get("CSM_TTS_SERVER_INSECURE_TLS", "0") == "1"
+CSM_SPEAKER = os.environ.get("CSM_SPEAKER", "conversational_a")  # conversational_a=female, conversational_b=male
+
+VOICE_PROMPTS = {
+    "conversational_a": (
+        "like revising for an exam I'd have to try and like keep up the momentum because I'd "
+        "start really early I'd be like okay I'm gonna start revising now and then like "
+        "you're revising for ages and then I just like start losing steam I didn't do that "
+        "for the exam we had recently to be fair that was a more of a last minute scenario "
+        "but like yeah I'm trying to like yeah I noticed this yesterday that like Mondays I "
+        "sort of start the day with this not like a panic but like a"
+    ),
+    "conversational_b": (
+        "like a super Mario level. Like it's very like high detail. And like, once you get "
+        "into the park, it just like, everything looks like a computer game and they have all "
+        "these, like, you know, if, if there's like a, you know, like in a Mario game, they "
+        "will have like a question block. And if you like, you know, punch it, a coin will "
+        "come out. So like everyone, when they come into the park, they get like this little "
+        "bracelet and then you can go punching question blocks around."
+    ),
+}
 
 
 class DefaultAgent(Agent):
@@ -111,6 +142,15 @@ server = AgentServer()
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
+    csm_tts = CSMRemoteTTS(server_url=CSM_TTS_SERVER_URL, insecure_tls=CSM_TTS_SERVER_INSECURE_TLS)
+    prompt_path = hf_hub_download(repo_id="sesame/csm-1b", filename=f"prompts/{CSM_SPEAKER}.wav")
+    prompt_wav, prompt_sr = torchaudio.load(prompt_path)
+    prompt_wav = torchaudio.functional.resample(
+        prompt_wav.mean(0), orig_freq=prompt_sr, new_freq=csm_tts.sample_rate
+    )
+    csm_tts.set_voice_prompt(text=VOICE_PROMPTS[CSM_SPEAKER], audio=prompt_wav)
+    proc.userdata["csm_tts"] = csm_tts
+
 
 server.setup_fnc = prewarm
 
@@ -122,11 +162,7 @@ async def entrypoint(ctx: JobContext):
         llm=inference.LLM(
             model="google/gemma-4-31b-it",
         ),
-        tts=inference.TTS(
-            model="inworld/inworld-tts-1.5-mini",
-            voice="Saanvi",
-            language="en-IN"
-        ),
+        tts=ctx.proc.userdata["csm_tts"],
         turn_handling=TurnHandlingOptions(turn_detection=MultilingualModel()),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,

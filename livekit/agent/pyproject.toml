@@ -12,6 +12,10 @@ dependencies = [
     "livekit-agents[silero,turn-detector]~=1.6",
     "livekit-plugins-ai-coustics~=0.3",
     "python-dotenv",
+    "torch",
+    "torchaudio",
+    "huggingface_hub==0.28.1",
+    "websockets",
 ]
 
 [dependency-groups]

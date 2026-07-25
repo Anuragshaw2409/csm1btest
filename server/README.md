@@ -1,22 +1,9 @@
-# CSM-1B streaming TTS server
+# CSM-1B TTS server
 
-Standalone WebSocket server that runs CSM-1B on a GPU box and streams
-generated audio back as it's produced, instead of waiting for a whole reply
-to finish (the shape of ElevenLabs' streaming TTS API, adapted to CSM). Meant
-to be called by `../livekit/agent/src/csm_tts_remote.py`, but the protocol is
-plain WebSocket + JSON/binary frames so any client can use it.
-
-## Why streaming needs help here
-
-CSM generates audio autoregressively, one 80ms RVQ "frame" at a time
-(`Generator._generate_frame_samples` in `../generator.py`), but the reference
-implementation (`Generator.generate`) only runs the Mimi codec's decode step
-once, after every frame for the whole reply has been sampled -- so nothing
-can be sent until the entire utterance is done. `Generator.generate_stream`
-(added alongside this server) instead keeps a Mimi *streaming* decode context
-open (`mimi.streaming(1)`, see `moshi.models.compression.MimiModel.decode`)
-and decodes+watermarks small groups of frames as they become available,
-yielding each as a chunk of PCM as soon as it's ready.
+Standalone WebSocket server that runs CSM-1B on a GPU box and, per utterance,
+generates the complete reply before sending it back as a single PCM blob.
+Meant to be called by `../livekit/agent/src/csm_tts_remote.py`, but the
+protocol is plain WebSocket + JSON/binary frames so any client can use it.
 
 ## Running it
 
@@ -35,7 +22,6 @@ local testing/a private network).
 Env vars (all optional):
 - `CSM_MAX_CONTEXT_SEGMENTS` (default `6`) -- how many recent turns to keep as generation context per connection.
 - `CSM_MAX_REPLY_AUDIO_MS` (default `15000`) -- cap on a single reply's length.
-- `CSM_STREAM_CHUNK_FRAMES` (default `12`, ≈960ms) -- how many 80ms frames to batch per streamed chunk. Smaller = lower latency but more decode/watermark overhead per second of audio and a shorter watermark window; see the note below.
 
 ## Wire protocol
 
@@ -63,26 +49,23 @@ Endpoint: `wss://<host>:8000/v1/tts/stream` (or `ws://` with `--no-tls`).
 
 ```jsonc
 {"type": "ready"}                              // after configure is applied
-// binary frames: PCM16LE mono @ 24kHz, in order, one per ~960ms of audio
+// one binary frame: the complete reply as PCM16LE mono @ 24kHz
 {"type": "done", "request_id": "abc123"}       // this utterance's audio is complete
 {"type": "error", "request_id": "abc123", "message": "..."}
 ```
 
 ## Watermarking
 
-Every response chunk is watermarked independently
+The complete reply is watermarked as a whole
 (`watermarking.py`'s `watermark()`, same key as the rest of this repo --
-**keep it in place**, see the top-level README's misuse policy). Watermarking
-needs a non-trivial audio window to embed reliably, which is why chunks
-default to ~1s rather than one chunk per 80ms frame; if you tighten
-`CSM_STREAM_CHUNK_FRAMES` for lower latency, spot-check with
-`watermarking.py --audio_path` that short chunks still verify.
+**keep it in place**, see the top-level README's misuse policy) before being
+sent to the client.
 
 ## GPU concurrency
 
 CSM's `Model` instance holds mutable KV-cache buffers that get reset/written
 on every call to `generate_frame`. One `Generator` is loaded once at server
 startup and shared across all connections; a single global `asyncio.Lock`
-serializes `generate_stream` calls across connections so two simultaneous
-rooms can't corrupt each other's cache state. This costs nothing but
-queuing, since one GPU serializes the actual compute anyway.
+serializes `generate` calls across connections so two simultaneous rooms
+can't corrupt each other's cache state. This costs nothing but queuing,
+since one GPU serializes the actual compute anyway.

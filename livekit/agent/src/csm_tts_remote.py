@@ -2,10 +2,10 @@
 Custom LiveKit Agents TTS plugin that calls a remote CSM-1B inference server
 (../../../server/tts_server.py) over a WebSocket instead of loading the model
 in-process. Use this instead of csm_tts.py when CSM runs on a separate GPU
-box from the agent process. Still a ChunkedStream (one full sentence in per
-call, same as csm_tts.py) -- but unlike csm_tts.py, audio is pushed to the
-output as each chunk arrives from the server, not all at once at the end, so
-playback starts well before the whole reply has finished generating.
+box from the agent process. A ChunkedStream (one full sentence in per call,
+same as csm_tts.py): the server generates the whole reply before sending it
+back as a single binary PCM16LE blob, so playback starts once the whole
+reply is ready, not before.
 
 See ../../../server/README.md for the wire protocol this speaks.
 """

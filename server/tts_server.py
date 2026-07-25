@@ -1,10 +1,11 @@
+
 """
 Standalone CSM-1B TTS inference server, meant to run on a remote GPU box.
 
 Exposes a single WebSocket endpoint (`/v1/tts/stream`) that a LiveKit agent
 (or any other client) can connect to once per conversation and drive with a
-small JSON control protocol, receiving audio back as binary PCM16LE chunks
-as soon as each is generated -- not one blob at the end. See ../server/README.md
+small JSON control protocol, receiving the complete reply audio back as a
+single binary PCM16LE blob once generation finishes. See ../server/README.md
 for the full wire protocol.
 
 Run with:
@@ -37,7 +38,6 @@ logger = logging.getLogger("csm-tts-server")
 
 MAX_CONTEXT_SEGMENTS = int(os.environ.get("CSM_MAX_CONTEXT_SEGMENTS", "6"))
 MAX_REPLY_AUDIO_MS = float(os.environ.get("CSM_MAX_REPLY_AUDIO_MS", "15000"))
-STREAM_CHUNK_FRAMES = int(os.environ.get("CSM_STREAM_CHUNK_FRAMES", "12"))  # ~960ms/chunk
 
 app = FastAPI()
 
@@ -46,7 +46,7 @@ logger.info(f"Loading CSM-1B on device={_device} ...")
 _generator = load_csm_1b(device=_device)
 logger.info("CSM-1B loaded.")
 
-# CSM's Model instance carries mutable KV-cache buffers that generate_stream()
+# CSM's Model instance carries mutable KV-cache buffers that generate()
 # resets/writes on every call -- serialize access across concurrent
 # connections so two rooms can't race on the same buffers. One GPU serializes
 # the actual compute anyway, so this costs nothing but queuing.
@@ -105,58 +105,23 @@ async def tts_stream(ws: WebSocket) -> None:
                 request_id = message.get("request_id", "")
                 text = message.get("text", "")
                 try:
-                    audio_chunks: list[torch.Tensor] = []
-
                     async with _gpu_lock:
-                        # generate_stream() is a blocking torch generator, so it
-                        # must run in a thread; forward each chunk to the socket
-                        # as soon as it's produced via a queue, rather than
-                        # waiting for the whole generator to finish.
-                        queue: asyncio.Queue = asyncio.Queue()
+                        # generate() is a blocking torch call, so it must run
+                        # in a thread. Unlike generate_stream(), it only
+                        # returns once the whole reply has been generated,
+                        # decoded and watermarked as a single tensor.
+                        full_audio = await loop.run_in_executor(
+                            None,
+                            lambda: _generator.generate(
+                                text=text,
+                                speaker=state.speaker_id,
+                                context=state.context,
+                                max_audio_length_ms=MAX_REPLY_AUDIO_MS,
+                            ),
+                        )
 
-                        def _produce() -> None:
-                            try:
-                                for chunk in _generator.generate_stream(
-                                    text=text,
-                                    speaker=state.speaker_id,
-                                    context=state.context,
-                                    max_audio_length_ms=MAX_REPLY_AUDIO_MS,
-                                    chunk_frames=STREAM_CHUNK_FRAMES,
-                                ):
-                                    audio_chunks.append(chunk)
-                                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
-                            finally:
-                                loop.call_soon_threadsafe(queue.put_nowait, None)
-
-                        producer = loop.run_in_executor(None, _produce)
-
-                        # A raw executor thread can't be cancelled once started --
-                        # if ws.send_bytes() fails partway (e.g. the client
-                        # disconnects/interrupts mid-reply), we must still drain
-                        # the queue until _produce() actually finishes before
-                        # releasing _gpu_lock. Otherwise a new request can start
-                        # generate_stream() while this one is still inside Mimi's
-                        # streaming() context, tripping its "already streaming"
-                        # assertion -- and the abandoned thread leaks forever.
-                        send_exc: Exception | None = None
-                        while True:
-                            chunk = await queue.get()
-                            if chunk is None:
-                                break
-                            if send_exc is None:
-                                try:
-                                    await ws.send_bytes(_pcm16_bytes(chunk))
-                                except Exception as exc:  # noqa: BLE001
-                                    send_exc = exc
-
-                        await producer
-                        if send_exc is not None:
-                            raise send_exc
-
-                    if audio_chunks:
-                        full_audio = torch.cat(audio_chunks)
-                        state.append_turn(text, full_audio)
-
+                    state.append_turn(text, full_audio)
+                    await ws.send_bytes(_pcm16_bytes(full_audio))
                     await ws.send_json({"type": "done", "request_id": request_id})
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("synthesize failed")
