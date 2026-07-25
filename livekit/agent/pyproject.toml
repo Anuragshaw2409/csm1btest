@@ -13,6 +13,7 @@ dependencies = [
     "livekit-plugins-openai~=1.5",
     "python-dotenv",
     "faster-whisper",
+    "websockets",  # remote CSM TTS mode (csm_tts_remote.py); harmless if unused in local mode
     # CSM-1B stack (must match ../../requirements.txt in the parent csm-main project)
     "torch==2.4.0",
     "torchaudio==2.4.0",

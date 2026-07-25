@@ -54,13 +54,24 @@ livekit/
 - **LLM**: `livekit.plugins.openai.LLM.with_ollama(model="llama3.2:1b")` --
   Ollama exposes an OpenAI-compatible `/v1/chat/completions` endpoint, so this
   is just the standard OpenAI plugin pointed at `localhost:11434`.
-- **TTS**: `csm_tts.py`'s `CSMTTS`, a non-streaming (`ChunkedStream`) plugin
-  that calls `generator.Generator.generate()` from the parent project in a
-  thread executor (CSM's generation is a blocking torch call) and pushes the
-  result as raw 16-bit PCM. Keeps a pinned voice-prompt segment
-  (`conversational_a` = female / `conversational_b` = male, set via
-  `CSM_SPEAKER`) plus a rolling window of recent turns as context, same as
-  `../webui.py` / `../talk.py`.
+- **TTS**: two interchangeable plugins, selected in `agent.py` by whether
+  `CSM_TTS_SERVER_URL` is set:
+  - **Local** (default): `csm_tts.py`'s `CSMTTS` calls
+    `generator.Generator.generate()` from the parent project in a thread
+    executor (CSM's generation is a blocking torch call) and pushes the
+    whole result as one raw-16-bit-PCM chunk once it's done. Requires CSM's
+    full torch/moshi stack in the agent process.
+  - **Remote**: `csm_tts_remote.py`'s `CSMRemoteTTS` instead calls
+    `../server/tts_server.py` running on a separate GPU box over a
+    WebSocket, and pushes each audio chunk to the room as it streams back
+    -- so playback can start well before the whole reply is generated. No
+    torch/moshi needed in the agent process in this mode. See
+    `../server/README.md` for the wire protocol and
+    `../setup_tts_server.sh` for standing up that server.
+
+  Both keep a pinned voice-prompt segment (`conversational_a` = female /
+  `conversational_b` = male, set via `CSM_SPEAKER`) plus a rolling window of
+  recent turns as context, same as `../webui.py` / `../talk.py`.
 
 ## Setup
 

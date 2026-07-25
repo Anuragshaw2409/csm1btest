@@ -22,7 +22,6 @@ from livekit.agents import (
 from livekit.plugins import openai, silero
 from livekit.plugins.turn_detector.english import EnglishModel
 
-from csm_tts import CSMTTS
 from whisper_stt import WhisperSTT
 
 logger = logging.getLogger("agent-csm-local")
@@ -34,6 +33,17 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base.en")
 CSM_SPEAKER = os.environ.get("CSM_SPEAKER", "conversational_a")  # conversational_a=female, conversational_b=male
+
+# If set, CSM runs on a remote GPU server (server/tts_server.py) and this
+# agent process calls it over a WebSocket instead of loading CSM in-process
+# -- e.g. wss://<gpu-host>:8000/v1/tts/stream. Unset by default (local mode).
+CSM_TTS_SERVER_URL = os.environ.get("CSM_TTS_SERVER_URL")
+CSM_TTS_SERVER_INSECURE_TLS = os.environ.get("CSM_TTS_SERVER_INSECURE_TLS", "0") == "1"
+
+if CSM_TTS_SERVER_URL:
+    from csm_tts_remote import CSMRemoteTTS
+else:
+    from csm_tts import CSMTTS
 
 VOICE_PROMPTS = {
     "conversational_a": (
@@ -103,7 +113,12 @@ def prewarm(proc: JobProcess):
 
     proc.userdata["whisper_stt"] = WhisperSTT(model_size=WHISPER_MODEL_SIZE, device=device)
 
-    csm_tts = CSMTTS(device=device)
+    if CSM_TTS_SERVER_URL:
+        logger.info(f"prewarm: using remote CSM TTS server at {CSM_TTS_SERVER_URL}")
+        csm_tts = CSMRemoteTTS(server_url=CSM_TTS_SERVER_URL, insecure_tls=CSM_TTS_SERVER_INSECURE_TLS)
+    else:
+        csm_tts = CSMTTS(device=device)
+
     prompt_path = hf_hub_download(repo_id="sesame/csm-1b", filename=f"prompts/{CSM_SPEAKER}.wav")
     prompt_wav, prompt_sr = torchaudio.load(prompt_path)
     prompt_wav = torchaudio.functional.resample(

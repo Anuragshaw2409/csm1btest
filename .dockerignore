@@ -1,0 +1,10 @@
+.git
+.venv
+livekit/
+__pycache__/
+*.pyc
+*.wav
+*.pt
+*.ckpt
+.certs/
+.claude/

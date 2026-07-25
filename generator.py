@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Iterator, List, Tuple
 
 import torch
 import torchaudio
@@ -105,19 +105,7 @@ class Generator:
 
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
 
-    @torch.inference_mode()
-    def generate(
-        self,
-        text: str,
-        speaker: int,
-        context: List[Segment],
-        max_audio_length_ms: float = 90_000,
-        temperature: float = 0.9,
-        topk: int = 50,
-    ) -> torch.Tensor:
-        self._model.reset_caches()
-
-        max_generation_len = int(max_audio_length_ms / 80)
+    def _tokenize_prompt(self, text: str, speaker: int, context: List[Segment]) -> Tuple[torch.Tensor, torch.Tensor]:
         tokens, tokens_mask = [], []
         for segment in context:
             segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
@@ -130,8 +118,20 @@ class Generator:
 
         prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
         prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+        return prompt_tokens, prompt_tokens_mask
 
-        samples = []
+    @torch.inference_mode()
+    def _generate_frame_samples(
+        self,
+        prompt_tokens: torch.Tensor,
+        prompt_tokens_mask: torch.Tensor,
+        max_generation_len: int,
+        temperature: float,
+        topk: int,
+    ) -> Iterator[torch.Tensor]:
+        """Autoregressively samples one RVQ frame (80ms of audio) at a time."""
+        self._model.reset_caches()
+
         curr_tokens = prompt_tokens.unsqueeze(0)
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
         curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
@@ -148,7 +148,7 @@ class Generator:
             if torch.all(sample == 0):
                 break  # eos
 
-            samples.append(sample)
+            yield sample
 
             curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
@@ -156,6 +156,7 @@ class Generator:
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
+    def _decode_and_watermark(self, samples: List[torch.Tensor]) -> torch.Tensor:
         audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
 
         # This applies an imperceptible watermark to identify audio as AI-generated.
@@ -164,8 +165,55 @@ class Generator:
         # If using CSM 1B in another application, use your own private key and keep it secret.
         audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
         audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
-
         return audio
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        text: str,
+        speaker: int,
+        context: List[Segment],
+        max_audio_length_ms: float = 90_000,
+        temperature: float = 0.9,
+        topk: int = 50,
+    ) -> torch.Tensor:
+        max_generation_len = int(max_audio_length_ms / 80)
+        prompt_tokens, prompt_tokens_mask = self._tokenize_prompt(text, speaker, context)
+
+        samples = list(
+            self._generate_frame_samples(prompt_tokens, prompt_tokens_mask, max_generation_len, temperature, topk)
+        )
+        return self._decode_and_watermark(samples)
+
+    @torch.inference_mode()
+    def generate_stream(
+        self,
+        text: str,
+        speaker: int,
+        context: List[Segment],
+        max_audio_length_ms: float = 90_000,
+        temperature: float = 0.9,
+        topk: int = 50,
+        chunk_frames: int = 12,
+    ) -> Iterator[torch.Tensor]:
+        """Same as `generate()`, but yields decoded audio incrementally, one
+        chunk of `chunk_frames` RVQ frames (~`chunk_frames * 80`ms) at a time,
+        instead of waiting for the whole reply to finish generating."""
+        max_generation_len = int(max_audio_length_ms / 80)
+        prompt_tokens, prompt_tokens_mask = self._tokenize_prompt(text, speaker, context)
+
+        with self._audio_tokenizer.streaming(1):
+            buffer: List[torch.Tensor] = []
+            for sample in self._generate_frame_samples(
+                prompt_tokens, prompt_tokens_mask, max_generation_len, temperature, topk
+            ):
+                buffer.append(sample)
+                if len(buffer) >= chunk_frames:
+                    yield self._decode_and_watermark(buffer)
+                    buffer = []
+
+            if buffer:
+                yield self._decode_and_watermark(buffer)
 
 
 def load_csm_1b(device: str = "cuda") -> Generator:
