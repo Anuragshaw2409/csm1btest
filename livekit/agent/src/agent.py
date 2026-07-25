@@ -1,74 +1,66 @@
-import asyncio
-import json
 import logging
-import os
 
-import torch
-import torchaudio
 from dotenv import load_dotenv
-from huggingface_hub import hf_hub_download
 from livekit.agents import (
     Agent,
     AgentServer,
+    AudioConfig,
     AgentSession,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     TurnHandlingOptions,
     cli,
-    metrics,
-    stt as stt_module,
+    inference,
+    room_io,
 )
-from livekit.plugins import openai, silero
-from livekit.plugins.turn_detector.english import EnglishModel
+from livekit.agents.beta.tools import EndCallTool
+from livekit.plugins import (
+    ai_coustics,
+    silero,
+)
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-from whisper_stt import WhisperSTT
-
-logger = logging.getLogger("agent-csm-local")
+logger = logging.getLogger("agent-customer-support-549")
 
 load_dotenv(".env.local")
-load_dotenv(".env")
-
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base.en")
-CSM_SPEAKER = os.environ.get("CSM_SPEAKER", "conversational_a")  # conversational_a=female, conversational_b=male
-
-# If set, CSM runs on a remote GPU server (server/tts_server.py) and this
-# agent process calls it over a WebSocket instead of loading CSM in-process
-# -- e.g. wss://<gpu-host>:8000/v1/tts/stream. Unset by default (local mode).
-CSM_TTS_SERVER_URL = os.environ.get("CSM_TTS_SERVER_URL")
-CSM_TTS_SERVER_INSECURE_TLS = os.environ.get("CSM_TTS_SERVER_INSECURE_TLS", "0") == "1"
-
-if CSM_TTS_SERVER_URL:
-    from csm_tts_remote import CSMRemoteTTS
-else:
-    from csm_tts import CSMTTS
-
-VOICE_PROMPTS = {
-    "conversational_a": (
-        "like revising for an exam I'd have to try and like keep up the momentum because I'd "
-        "start really early I'd be like okay I'm gonna start revising now and then like "
-        "you're revising for ages and then I just like start losing steam I didn't do that "
-        "for the exam we had recently to be fair that was a more of a last minute scenario "
-        "but like yeah I'm trying to like yeah I noticed this yesterday that like Mondays I "
-        "sort of start the day with this not like a panic but like a"
-    ),
-    "conversational_b": (
-        "like a super Mario level. Like it's very like high detail. And like, once you get "
-        "into the park, it just like, everything looks like a computer game and they have all "
-        "these, like, you know, if, if there's like a, you know, like in a Mario game, they "
-        "will have like a question block. And if you like, you know, punch it, a coin will "
-        "come out. So like everyone, when they come into the park, they get like this little "
-        "bracelet and then you can go punching question blocks around."
-    ),
-}
 
 
 class DefaultAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
+            instructions="""You are a helpful, concise customer support voice agent for Techax Labs. Your job is to understand the customer's issue, gather the minimum necessary context, and either resolve the issue clearly or guide the customer to the right next step.
+
+Goals:
+- Understand what the customer is trying to do.
+- Identify what went wrong or what information is missing.
+- Resolve simple issues directly when possible.
+- Escalate cleanly when the issue requires a human or a backend action.
+
+Rules:
+- Be calm, direct, and empathetic.
+- Start by confirming the customer's goal in one sentence.
+- Ask one or two focused questions at a time.
+- Prefer concrete next steps over generic reassurance.
+- Do not invent account details, order details, or policies.
+- If the customer is frustrated, acknowledge that and stay practical.
+- If you cannot complete the request, explain what the next best action is.
+
+Conversation outline:
+1. Understand the issue.
+2. Gather key context.
+3. Offer troubleshooting or status guidance.
+4. Confirm whether the issue is resolved.
+5. Summarize the next step if not resolved.
+
+# Language
+
+- You can speak both Hindi and English.
+- Detect the language the customer is speaking in and reply in that same language. If they speak in Hindi, reply fully in Hindi. If they speak in English, reply fully in English.
+- If the customer mixes both languages, mirror their mix naturally rather than forcing a single language.
+- If the customer switches languages mid-conversation, switch with them on your next reply.
+- Keep terms that don't translate naturally (e.g. proper nouns, account or order numbers) as-is, spoken clearly.
 
 # Output rules
 
@@ -81,124 +73,82 @@ You are interacting with the user via voice, and must apply the following rules 
 - Omit `https://` and other formatting if listing a web url
 - Avoid acronyms and words with unclear pronunciation, when possible.
 
+# Conversational flow
+
+- Help the user accomplish their objective efficiently and correctly. Prefer the simplest safe step first. Check understanding and adapt.
+- Provide guidance in small steps and confirm completion before continuing.
+- Summarize key results when closing a topic.
+
+# Tools
+
+- Use available tools as needed, or upon user request.
+- Collect required inputs first. Perform actions silently if the runtime expects it.
+- Speak outcomes clearly. If an action fails, say so once, propose a fallback, or ask how to proceed.
+- When tools return structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
+
 # Guardrails
 
 - Stay within safe, lawful, and appropriate use; decline harmful or out‑of‑scope requests.
 - For medical, legal, or financial topics, provide general information only and suggest consulting a qualified professional.
 - Protect privacy and minimize sensitive data.""",
+            tools=[EndCallTool(
+                extra_description="""If the user behaves badly or becomes abusive.""",
+                end_instructions="""Only end the call once the customer confirms they are done or it is clear the next step has been handed off. Before ending, summarize the resolution or next action in one or two sentences.""",
+                delete_room=False,
+            )],
         )
 
     async def on_enter(self):
         await self.session.generate_reply(
-            instructions="""Greet the user and offer your assistance.""",
+            instructions="""Hi, thanks for calling Techax Labs support. I can help with questions, troubleshooting, or account issues. What are you trying to do today?""",
             allow_interruptions=True,
         )
 
 
-server = AgentServer(
-    # Loading CSM-1B + Whisper + VAD + turn-detector in prewarm() takes well
-    # past the 10s default, especially on CPU or a cold model cache.
-    initialize_process_timeout=180.0,
-)
+server = AgentServer()
 
 
 def prewarm(proc: JobProcess):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"prewarm: loading local models on device={device}")
-
-    # Default min_silence_duration (0.55s) waits nearly half a second of silence
-    # before VAD even declares end-of-speech. Trimmed to cut perceived turn-detection
-    # latency; if the agent starts cutting people off mid-sentence, raise this back up.
-    proc.userdata["vad"] = silero.VAD.load(min_silence_duration=0.3)
-
-    proc.userdata["whisper_stt"] = WhisperSTT(model_size=WHISPER_MODEL_SIZE, device=device)
-
-    if CSM_TTS_SERVER_URL:
-        logger.info(f"prewarm: using remote CSM TTS server at {CSM_TTS_SERVER_URL}")
-        csm_tts = CSMRemoteTTS(server_url=CSM_TTS_SERVER_URL, insecure_tls=CSM_TTS_SERVER_INSECURE_TLS)
-    else:
-        csm_tts = CSMTTS(device=device)
-
-    prompt_path = hf_hub_download(repo_id="sesame/csm-1b", filename=f"prompts/{CSM_SPEAKER}.wav")
-    prompt_wav, prompt_sr = torchaudio.load(prompt_path)
-    prompt_wav = torchaudio.functional.resample(
-        prompt_wav.mean(0), orig_freq=prompt_sr, new_freq=csm_tts.sample_rate
-    )
-    csm_tts.set_voice_prompt(text=VOICE_PROMPTS[CSM_SPEAKER], audio=prompt_wav)
-    proc.userdata["csm_tts"] = csm_tts
-
-    logger.info("prewarm: done")
+    proc.userdata["vad"] = silero.VAD.load()
 
 
 server.setup_fnc = prewarm
 
 
-@server.rtc_session(agent_name=os.environ.get("AGENT_NAME", "csm-local-agent"))
+@server.rtc_session(agent_name="customer-support-549")
 async def entrypoint(ctx: JobContext):
     session = AgentSession(
-        stt=stt_module.StreamAdapter(stt=ctx.proc.userdata["whisper_stt"], vad=ctx.proc.userdata["vad"]),
-        llm=openai.LLM.with_ollama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL),
-        tts=ctx.proc.userdata["csm_tts"],
-        turn_handling=TurnHandlingOptions(
-            turn_detection=EnglishModel(),
-            # "dynamic" only waits the full max_delay when the model is unsure the
-            # turn ended; min_delay is the floor for confident endings (default 0.5s).
-            endpointing={"mode": "dynamic", "min_delay": 0.2, "max_delay": 2.0},
+        stt=inference.STT(model="deepgram/nova-3-multi", language="multi"),
+        llm=inference.LLM(
+            model="google/gemma-4-31b-it",
         ),
+        tts=inference.TTS(
+            model="inworld/inworld-tts-1.5-mini",
+            voice="Saanvi",
+            language="en-IN"
+        ),
+        turn_handling=TurnHandlingOptions(turn_detection=MultilingualModel()),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
 
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
-        payload = _metrics_to_payload(ev.metrics)
-        if payload is None:
-            return
-        asyncio.create_task(
-            ctx.room.local_participant.publish_data(
-                json.dumps(payload).encode("utf-8"),
-                topic="latency_metrics",
-            )
-        )
+    await session.start(
+        agent=DefaultAgent(),
+        room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=ai_coustics.audio_enhancement(
+                    model=ai_coustics.EnhancerModel.QUAIL_VF_S,
+                ),
+            ),
+        ),
+    )
 
-    await session.start(agent=DefaultAgent(), room=ctx.room)
+    background_audio = BackgroundAudioPlayer(
+        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=1.0),
+    )
 
-
-def _metrics_to_payload(m: metrics.AgentMetrics) -> dict | None:
-    """Reduce an SDK metrics object to the fields the frontend latency panel needs."""
-    base = {"timestamp": m.timestamp}
-
-    if isinstance(m, metrics.STTMetrics):
-        return {
-            **base,
-            "stage": "stt",
-            "duration_ms": round(m.duration * 1000, 1),
-            "audio_duration_ms": round(m.audio_duration * 1000, 1),
-        }
-    if isinstance(m, metrics.LLMMetrics):
-        return {
-            **base,
-            "stage": "llm",
-            "ttft_ms": round(m.ttft * 1000, 1),
-            "duration_ms": round(m.duration * 1000, 1),
-            "tokens_per_second": round(m.tokens_per_second, 1),
-        }
-    if isinstance(m, metrics.TTSMetrics):
-        return {
-            **base,
-            "stage": "tts",
-            "ttfb_ms": round(m.ttfb * 1000, 1),
-            "duration_ms": round(m.duration * 1000, 1),
-        }
-    if isinstance(m, metrics.EOUMetrics):
-        return {
-            **base,
-            "stage": "eou",
-            "end_of_utterance_delay_ms": round(m.end_of_utterance_delay * 1000, 1),
-            "transcription_delay_ms": round(m.transcription_delay * 1000, 1),
-        }
-    # VAD, interruption, and other diagnostic metrics aren't shown in the latency panel.
-    return None
+    await background_audio.start(room=ctx.room, agent_session=session)
 
 
 if __name__ == "__main__":
